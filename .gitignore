@@ -1,0 +1,5 @@
+*.sjsir
+js/target/*
+jvm/target/*
+target/*
+project/*
