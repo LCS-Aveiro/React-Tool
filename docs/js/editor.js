@@ -88,3 +88,21 @@ function deleteUserModel() {
         updateExamplesDropdown();
     }
 }
+
+
+function createNewModel() {
+    const name = prompt(currentLang === 'pt' ? "Nome do novo modelo:" : "New model name:");
+    if (!name) return;
+
+    const fileName = name.replace(".rta", "");
+    const template = `name ${fileName}\ninit s0\ns0 ---> s1: a`;
+
+    let userModels = JSON.parse(localStorage.getItem(USER_MODELS_KEY) || '{}');
+    userModels[fileName] = template;
+    localStorage.setItem(USER_MODELS_KEY, JSON.stringify(userModels));
+
+    updateProjectTree();
+    loadModelFromTree(template, fileName);
+    
+    document.getElementById('project-context-menu').style.display = 'none';
+}

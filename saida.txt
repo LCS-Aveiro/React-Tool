@@ -1,0 +1,1950 @@
+--- ARQUIVO: AnalyseLTS.scala ---
+Caminho: shared/src/main/scala/rta\backend\AnalyseLTS.scala
+------------------------------
+package rta.backend
+
+import rta.syntax.Program2.{Edges, RxGraph, QName, Edge, showEdges}
+import rta.syntax.Condition
+import scala.util.boundary, boundary.break
+
+object AnalyseLTS:
+
+  /** Traverse the state space, while collecting all states and edges, and collect warning regarding:
+   *    - deadlocks
+   *    - unreachable edges and states
+   *    - inconsistent activation/deactivation
+   *    - too large
+   */
+
+  case class FastStateKey(inits: Set[QName], vars: Map[QName, Int])
+
+  def randomWalk(rx:RxGraph, max:Int=5000): (Set[RxGraph],Int,Edges,List[String]) =
+    val states = for (a, bs) <- rx.edg.toSet; (b, id, lbl) <- bs; s <- Set(a, b) yield s
+    
+    def aux(next:Set[RxGraph], done:Set[RxGraph],
+            nEdges:Int, fired:Edges, probs:List[String],
+            limit:Int): (Set[RxGraph],Int,Edges,List[String]) =
+      if limit <=0 then
+        return (done,nEdges,fired, s"Reached limit - traversed +$max edges."::probs)
+      
+      next.headOption match
+        case None =>
+          val missingStates: Set[QName] =
+            (rx.inits ++ fired.map(_._2)).intersect(states) -- done.flatMap(_.inits)
+          
+          val allPossibleEdges: Edges =
+            (for (a, dests) <- rx.edg.toSet; (b, id, lbl) <- dests yield (a, b, id, lbl)) ++
+            (for (a, dests) <- rx.on.toSet;  (b, id, lbl) <- dests yield (a, b, id, lbl)) ++
+            (for (a, dests) <- rx.off.toSet; (b, id, lbl) <- dests yield (a, b, id, lbl))
+          
+          val missingEdges: Edges = allPossibleEdges -- fired
+          
+          if missingStates.isEmpty && missingEdges.isEmpty then
+            (done, nEdges, fired, probs)
+          else
+            val stateErrs = if missingStates.nonEmpty 
+                            then List(s"Unreachable state(s): ${missingStates.mkString(",")}") else Nil
+            val edgeErrs = if missingEdges.nonEmpty  
+                           then List(s"Unreachable edge(s): ${showEdges(missingEdges)}") else Nil
+            (done, nEdges, fired, stateErrs ::: edgeErrs ::: probs)
+
+        case Some(st) if done contains st =>
+          aux(next-st, done, nEdges, fired, probs, limit)
+
+        case Some(st) => 
+          val more = RxSemantics.nextEdge(st)
+          val nEdges2 = more.size
+          val newEdges = more.map(_._1)
+          var incons = Set[String]()
+          var moreEdges: Edges = Set()
+
+          for e <- newEdges do
+            val (toAct, toDeact, _) = RxSemantics.toOnOff(e, st)
+            val fromE = RxSemantics.from(e, st)
+            moreEdges = moreEdges ++ fromE
+            
+            val shared = toAct.intersect(toDeact)
+            if shared.nonEmpty then
+              val triggers = fromE -- shared
+              incons = incons + s"activating and deactivating `${showEdges(shared)}` by `${showEdges(triggers)}`"
+
+          var newProbs = probs
+          if more.isEmpty then newProbs = s"Deadlock found at: ${st.inits.mkString(",")}" :: newProbs
+          if incons.nonEmpty then newProbs = s"Found inconsistency: ${incons.mkString(", ")}" :: newProbs
+          
+          aux((next - st) ++ more.map(_._2), 
+              done + st, 
+              nEdges + nEdges2, 
+              fired ++ newEdges ++ moreEdges, 
+              newProbs, 
+              limit - nEdges2)
+
+    aux(Set(rx), Set(), 0, Set(), Nil, max)
+
+  def findShortestPath(start: RxGraph, targetName: QName, maxStates: Int = 3000): Option[List[String]] = {
+    val queue = collection.mutable.Queue[(RxGraph, List[String])]()
+    queue.enqueue((start, Nil))
+    var visited = Set[RxGraph]()
+    
+    while (queue.nonEmpty && visited.size < maxStates) {
+      val (current, path) = queue.dequeue()
+      if (current.inits.contains(targetName)) {
+        return Some(path)
+      }
+      if (!visited.contains(current)) {
+        visited += current
+        val transitions = RxSemantics.nextEdge(current)
+        for ((edge, nextGraph) <- transitions) {
+          val label = edge._4.show
+          queue.enqueue((nextGraph, path :+ label))
+        }
+      }
+    }
+    None
+  }
+
+  def findShortestPathToCondition(start: RxGraph, targetCond: Condition, maxStates: Int = 50000): Option[List[String]] = boundary:
+    if (Condition.evaluate(targetCond, start.val_env)) break(Some(Nil))
+
+    val queue = collection.mutable.Queue[RxGraph]()
+    val parentOf = collection.mutable.Map[FastStateKey, (RxGraph, String)]()
+    
+    val startKey = FastStateKey(start.inits, start.val_env)
+    queue.enqueue(start)
+    
+    var visitedCount = 0
+
+    while (queue.nonEmpty && visitedCount < maxStates) {
+      val current = queue.dequeue()
+      visitedCount += 1
+
+      val transitions = RxSemantics.nextEdge(current)
+      
+      for ((edge, nextGraph) <- transitions) {
+        val nextKey = FastStateKey(nextGraph.inits, nextGraph.val_env)
+        
+        if (!parentOf.contains(nextKey) && nextKey != startKey) {
+          val label = edge._4.show
+          parentOf(nextKey) = (current, label)
+
+          if (Condition.evaluate(targetCond, nextGraph.val_env)) {
+            // CORREÇÃO: Usamos break em vez de return para silenciar o warning
+            break(Some(reconstructFastPath(nextKey, parentOf)))
+          }
+
+          queue.enqueue(nextGraph)
+        }
+      }
+    }
+    None
+
+  // Função de reconstrução com tipos fortes e sem warnings
+  private def reconstructFastPath(
+    targetKey: FastStateKey, 
+    parentOf: collection.mutable.Map[FastStateKey, (RxGraph, String)]
+  ): List[String] = {
+    val path = collection.mutable.ListBuffer[String]()
+    var currKey = targetKey
+    
+    // Enquanto o estado atual tiver um "pai" registrado no mapa
+    while (parentOf.contains(currKey)) {
+      val (parentGraph, label) = parentOf(currKey)
+      path.prepend(label)
+      // Atualiza a chave para o pai para continuar subindo a árvore
+      currKey = FastStateKey(parentGraph.inits, parentGraph.val_env)
+    }
+    path.toList
+  }
+
+--- ARQUIVO: CytoscapeConverter.scala ---
+Caminho: shared/src/main/scala/rta\backend\CytoscapeConverter.scala
+------------------------------
+package rta.backend
+
+import rta.syntax.Program2.{Edge, RxGraph, QName}
+import rta.syntax.{Condition, UpdateExpr, Statement, UpdateStmt, IfThenStmt}
+
+object CytoscapeConverter {
+
+  private def formatStatements(stmts: List[Statement], indent: String = ""): String = {
+    stmts.map {
+      case UpdateStmt(upd) =>
+        s"${indent}${upd.variable.show}' := ${UpdateExpr.show(upd.expr)}"
+      case IfThenStmt(condition, thenStmts) =>
+        val conditionLine = s"${indent}if (${condition.toMermaidString}) then {"
+        val thenBlock = formatStatements(thenStmts, indent + "  ")
+        val closingBrace = s"${indent}}"
+        Seq(conditionLine, thenBlock, closingBrace).filter(_.nonEmpty).mkString("\n")
+    }.mkString("\n")
+  }
+
+  private def escapeJson(text: String): String = {
+    text.replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+  }
+
+  def apply(rx: RxGraph, showRules: Boolean = true): String = {
+    val allSimpleEdges: Set[Edge] = rx.edg.flatMap { case (f, ts) => ts.map(t => (f, t._1, t._2, t._3)) }.toSet
+    val allOnEdges: Set[Edge]     = if (showRules) rx.on.flatMap  { case (f, ts) => ts.map(t => (f, t._1, t._2, t._3)) }.toSet else Set()
+    val allOffEdges: Set[Edge]    = if (showRules) rx.off.flatMap { case (f, ts) => ts.map(t => (f, t._1, t._2, t._3)) }.toSet else Set()
+
+    val edgesThatCreateNodes = allSimpleEdges.filter(_._4.n.nonEmpty) ++ allOnEdges ++ allOffEdges
+
+    val allQNames = rx.states ++ edgesThatCreateNodes.flatMap(e => Set(e._1, e._2, e._3, e._4))
+    val parentQNames = allQNames.flatMap(q => (1 until q.n.length).map(i => QName(q.n.take(i)))).toSet
+
+    val parentNodes = parentQNames.map { parentQName =>
+      val parentId = if (parentQName.n.size > 1) Some(parentQName.scope.toString) else None
+      val parentJson = parentId.map(p => s""", "parent": "$p"""").getOrElse("")
+      s"""{ "data": { "id": "${parentQName.toString}", "label": "${parentQName.n.last}" ${parentJson} }, "classes": "compound-parent" }"""
+    }
+
+    val stateNodes = rx.states.map { state =>
+      val parentId = if (state.n.size > 1) Some(state.scope.toString) else None
+      val parentJson = parentId.map(p => s""", "parent": "$p"""").getOrElse("")
+      // Removida a lógica de invariantes aqui
+      val classes = "state-node " + (if (rx.inits.contains(state)) "current-state" else "")
+      
+      s"""{ "data": { "id": "${state.toString}", "label": "${state.show}" ${parentJson} }, "classes": "$classes" }"""
+    }
+
+    val eventNodes = edgesThatCreateNodes.map { edge =>
+      val (from: QName, to: QName, transId: QName, lbl: QName) = edge
+      val id = s"event_${from}_${to}_${transId}_${lbl}"
+
+      val visualLabel = transId.show
+      val labelText = if (transId == lbl || transId.n.isEmpty) lbl.show else s"${lbl.show}(${transId.show})"
+
+      val parentId = List(lbl, from, to).find(_.n.size > 1).map(_.asInstanceOf[QName].scope.toString)
+      val parentJson = parentId.map(p => s""", "parent": "$p"""").getOrElse("")
+
+      val isEnabled = rx.act.contains(edge)
+      val isAction = allSimpleEdges.contains(edge)
+      val nodeTypeClass = if (isAction) "action-node" else "rule-node"
+      val hoverLabelField = if (isAction) s""", "hover_label": "${escapeJson(labelText)}" """ else ""
+
+      val classes = s"event-node $nodeTypeClass " + (if (isEnabled) "enabled" else "disabled")
+      s"""{ "data": { "id": "$id", "label": "$visualLabel" $hoverLabelField ${parentJson} }, "classes": "$classes" }"""
+    }
+
+    val simpleConnections = allSimpleEdges.filter(_._4.n.nonEmpty).flatMap { edge =>
+      val (from: QName, to: QName, transId: QName, lbl: QName) = edge
+      val actionNodeId = s"event_${from}_${to}_${transId}_${lbl}"
+      val isDisabled = !rx.act.contains(edge)
+      val disabledClass = if (isDisabled) " disabled" else ""
+      
+      val labelThreshold = 30 
+      val fullConditionLabel = rx.edgeConditions.getOrElse(edge, None)
+        .map(cond => s"[${cond.toMermaidString}]")
+        .getOrElse("")
+      
+      var conditionDisplayLabel = fullConditionLabel
+      var conditionExtraData = ""
+      var conditionClasses = ""
+
+      if (fullConditionLabel.length > labelThreshold) {
+        conditionDisplayLabel = "[...]"
+        conditionExtraData = s""", "full_label": "${escapeJson(fullConditionLabel)}", "short_label": "[...]" """
+        conditionClasses = " has-details"
+      }
+
+      val updates = rx.edgeUpdates.getOrElse(edge, Nil)
+      val fullUpdateLabel = formatStatements(updates).replace("\n", " ") 
+      var updateDisplayLabel = fullUpdateLabel
+      var updateExtraData = ""
+      var updateClasses = ""
+
+      if (fullUpdateLabel.length > labelThreshold) {
+        updateDisplayLabel = "{...}"
+        updateExtraData = s""", "full_label": "${escapeJson(fullUpdateLabel)}", "short_label": "{...}" """
+        updateClasses = " has-details"
+      }
+
+      List(
+        formatCyEdge(s"s_to_a_${from}_${actionNodeId}", from.toString, actionNodeId, conditionDisplayLabel, s"simple-conn$disabledClass$conditionClasses", conditionExtraData),
+        formatCyEdge(s"a_to_s_${actionNodeId}_${to}", actionNodeId, to.toString, updateDisplayLabel, s"simple-conn from-action-node$disabledClass$updateClasses", updateExtraData)
+      )
+    }
+  
+    val hyperConnections = if (showRules) {
+      (allOnEdges ++ allOffEdges).flatMap { ruleEdge =>
+      val (fromTrigger: QName, toTarget: QName, ruleId: QName, ruleLabel: QName) = ruleEdge
+      val ruleNodeId = s"event_${fromTrigger}_${toTarget}_${ruleId}_${ruleLabel}"
+
+      val fromEventNodes = edgesThatCreateNodes.filter(_._4 == fromTrigger)
+      val toEventNodes = edgesThatCreateNodes.filter(_._4 == toTarget)
+
+      val isRuleDisabled = !rx.act.contains(ruleEdge)
+      val disabledClass = if (isRuleDisabled) " disabled" else ""
+      val ruleClass = if (allOnEdges.contains(ruleEdge)) "enable-rule" else "disable-rule"
+
+      for {
+        fNode <- fromEventNodes
+        tNode <- toEventNodes
+      } yield {
+        val fNodeId = s"event_${fNode._1}_${fNode._2}_${fNode._3}_${fNode._4}"
+        val tNodeId = s"event_${tNode._1}_${tNode._2}_${tNode._3}_${tNode._4}"
+        List(
+            formatCyEdge(s"rule_from_${fNodeId}_${ruleNodeId}", fNodeId, ruleNodeId, "", s"rule-edge $ruleClass$disabledClass"),
+            formatCyEdge(s"rule_to_${ruleNodeId}_${tNodeId}", ruleNodeId, tNodeId, "", s"rule-edge from-rule-node to-target $ruleClass$disabledClass")
+        )
+      }
+    }.flatten
+    } else Nil
+
+    val allNodes = (parentNodes ++ stateNodes ++ eventNodes).filter(_.nonEmpty).mkString(",\n")
+    val allConnections = (simpleConnections ++ hyperConnections).filter(_.nonEmpty).mkString(",\n")
+
+    s"""[ ${Seq(allNodes, allConnections).filter(_.nonEmpty).mkString(",\n")} ]"""
+  }
+
+  private def formatCyEdge(id: String, source: String, target: String, label: String, classes: String, extraData: String = ""): String =
+    s"""{ "data": { "id": "$id", "source": "$source", "target": "$target", "label": "${escapeJson(label)}"$extraData }, "classes": "$classes" }"""
+}
+
+--- ARQUIVO: MCRL2.scala ---
+Caminho: shared/src/main/scala/rta\backend\MCRL2.scala
+------------------------------
+package rta.backend
+
+//import rta.frontend.Examples
+import rta.syntax.Parser2
+import rta.syntax.Program2.{QName, RxGraph}
+
+object MCRL2:
+  def apply(rx: RxGraph): String =
+    implicit val mod = findModLbl(using rx)
+    implicit val rx2 = rx
+    val onoff = mkONOFF(mod)
+    val procs = rx.inits.flatMap(mkProc(_))
+    //
+    val syncs = findActions
+    val disabled = findDisLbl
+    val allow = rx.edg.flatMap(e => e._2.map(_._2))
+    val lbl = findAllLbl ++ syncs.values.toSet.flatten
+    val procNames =
+      rx.inits.map(s=>s"P_${mkMAction(s)}") ++
+      (mod/*++disabled*/).map(n => if disabled(n)
+                   then s"OFF_${mkMAction(n)}"
+                   else s"ON_${mkMAction(n)}")
+//    println(s"--- ON OFFs ${mod.mkString(",")} ---")
+//    println(onoff.mkString("\n"))
+//    println(s"--- inits ---")
+//    println(procs.mkString("\n"))
+//    println("--- syncs ---")
+//    println(syncs.map(kv => s" - ${mkMAction(kv._1)} -> ${kv._2.mkString(",")}").mkString("\n"))
+
+    s"""act
+       |  ${lbl.mkString(",")};
+       |proc
+       |${procs.map("  "+_).mkString("\n")}
+       |
+       |${onoff.map("  "+_).mkString("\n")}
+       |init
+       |  % Experiments (proc names)
+       |  ${procNames.mkString(", ")}
+       |  % Experiments (sync groups)
+       |${syncs.map(kv => s"  - ${mkMAction(kv._1)} <- ${kv._2.mkString(",")}").mkString("\n")}
+       |  % Experiments (allow)
+       |  ${allow.mkString(", ")}
+       |
+       |% Possible problems with empty names and repeated names
+       |""".stripMargin
+//    s"--- ON OFFs ${mod.mkString(",")} ---\n" +
+//    onoff.mkString("\n") + "\n" +
+//    s"--- inits ---\n" +
+//    procs.mkString("\n") + "\n" +
+//    "--- syncs ---\n" +
+//    syncs.map(kv => s" - ${mkMAction(kv._1)} -> ${kv._2.mkString(",")}").mkString("\n")
+
+
+  def findModLbl(using rx: RxGraph): Set[QName] =
+    (for (e <- rx.on .toSet; trg <- e._2) yield trg._1) ++
+    (for (e <- rx.off.toSet; trg <- e._2) yield trg._1)
+
+  def findAllLbl(using rx:RxGraph): Set[QName] =
+    (for (e<-rx.edg.toSet; trg<-e._2) yield trg._2) ++
+    (for (e<-rx.on .toSet; trg<-e._2) yield trg._2) ++
+    (for (e<-rx.off.toSet; trg<-e._2) yield trg._2)
+
+  def findDisLbl(using rx: RxGraph): Set[QName] =
+    findAllLbl -- rx.act.map(_._3) - QName(Nil)
+
+  def mkONOFF(n:QName): List[String] =
+    val lbl = mkMAction(n)
+    List(s"ON_$lbl = (${lbl}_2+act_$lbl).ON_$lbl + deact_$lbl.OFF_$lbl",
+         s"OFF_$lbl = act_$lbl.ON_$lbl + deact_$lbl.OFF_$lbl")
+
+  def mkONOFF(mod: Set[QName]): List[String] =
+    mod.toList.flatMap(mkONOFF)
+
+  private def mkMAction(q:QName): String =
+    if q.n.isEmpty then "_tau" else q.n.mkString("-")
+  private def hasToSync(q:QName)(using rx: RxGraph, mod: Set[QName]): Boolean =
+    mod(q) || rx.on.contains(q) || rx.off.contains(q)
+
+  def mkProc(s:QName, done:Set[QName]=Set())(using rx: RxGraph, mod: Set[QName]): List[String] =
+    if done(s) then Nil else
+      val options = for next <- rx.edg(s)  yield
+        val lbl = if hasToSync(next._2) then s"${mkMAction(next._2)}_1" else mkMAction(next._2)
+        s"$lbl.P_${mkMAction(next._1)}"
+      val more = rx.edg(s).toList
+        .map(next => mkProc(next._1,(done++(rx.edg(s).map(_._1)-next._1))+s)) // done other destinations and s
+      if options.nonEmpty
+      then s"P_${mkMAction(s)} = ${options.mkString(" + ")}" :: more.flatten
+      else s"P_${mkMAction(s)} = delta" :: more.flatten
+
+  def findActions(using rx: RxGraph, mod: Set[QName]): Map[QName,Set[String]] =
+    // for each modified label l, sync l1 -> l_1,l_2
+    var acts = (for e<-mod yield
+      e -> Set(s"${mkMAction(e)}_1",s"${mkMAction(e)}_2"))
+      .toMap
+    // for each activated label l1->>l2:l3, sync l1 -> l1_1,act_l2
+    for e<-rx.on; trg<-e._2 do
+      acts = acts + (e._1 -> (acts.getOrElse(e._1,Set(mkMAction(e._1)))
+        +s"act_${mkMAction(trg._1)}" ))
+    // for each deactivated label l1--x l2:l3, sync l1 -> l1_1,act_l2
+    for e<-rx.off; trg<-e._2 do
+      acts = acts + (e._1 -> (acts.getOrElse(e._1,Set(mkMAction(e._1)))
+        +s"deact_${mkMAction(trg._1)}" ))
+    acts
+
+
+
+
+
+--- ARQUIVO: PdlEvaluator.scala ---
+Caminho: shared/src/main/scala/rta\backend\PdlEvaluator.scala
+------------------------------
+package rta.backend
+
+import rta.syntax.Program2.{QName, RxGraph}
+import rta.syntax.Condition
+
+import rta.syntax.Formula as PdlFormula
+import rta.syntax.Formula.*
+import rta.syntax.PdlProgram
+import rta.syntax.PdlProgram.*
+
+import scala.annotation.tailrec
+
+object PdlEvaluator {
+
+  private def evaluateProgram(initialConfigs: Set[RxGraph], program: PdlProgram): Set[RxGraph] = {
+    program match {
+      case Act(nameFromFormula) =>
+        initialConfigs.flatMap { config =>
+          val fullPath = nameFromFormula.n
+
+          // Removida a verificação de "delay"
+          config.inits.flatMap { initState =>
+            val singleStateConfig = config.copy(inits = Set(initState))
+            val transitions = RxSemantics.nextEdge(singleStateConfig)
+
+            transitions
+              .filter { case ((from, to, transId, label), _) =>
+                val currentScope = from.scope
+                
+                if (fullPath.size > 1) {
+                  val fLabel = QName(List(fullPath.head))
+                  val fId = QName(List(fullPath.last))
+                  (fLabel == label && fId == transId) || 
+                  ((currentScope / fLabel) == label && fId == transId)
+                } else {
+                  (nameFromFormula == label) || (nameFromFormula == (currentScope / label))
+                }
+              }
+              .map { case (_, nextRxFromSemantic) =>
+                val otherInits = config.inits - initState
+                val correctGlobalInits = otherInits ++ nextRxFromSemantic.inits
+                nextRxFromSemantic.copy(inits = correctGlobalInits)
+              }
+          }
+        }
+
+      case Seq(p, q) =>
+        val intermediateConfigs = evaluateProgram(initialConfigs, p)
+        evaluateProgram(intermediateConfigs, q)
+
+      case Choice(p, q) =>
+        evaluateProgram(initialConfigs, p) ++ evaluateProgram(initialConfigs, q)
+
+      case Star(p) =>
+        @tailrec
+        def fixedPoint(currentConfigs: Set[RxGraph], seenConfigs: Set[RxGraph]): Set[RxGraph] = {
+          val newConfigs = evaluateProgram(currentConfigs, p) -- seenConfigs
+          if (newConfigs.isEmpty) {
+            seenConfigs
+          } else {
+            fixedPoint(newConfigs, seenConfigs ++ newConfigs)
+          }
+        }
+        fixedPoint(initialConfigs, initialConfigs)
+    }
+  }
+
+  // O método advanceTimeExplicit foi removido completamente
+
+  private def evaluateFormula(config: RxGraph, formula: PdlFormula): Boolean = {
+    if (config.inits.isEmpty) return false
+
+    formula match {
+      case True => true
+      case False => false
+      case StateProp(name) =>
+        config.inits.contains(name)
+
+      case CondProp(cond) =>
+        // Removido o clock_env da avaliação da condição
+        Condition.evaluate(cond, config.val_env)
+
+      case Not(p) => !evaluateFormula(config, p)
+      case And(p, q) => evaluateFormula(config, p) && evaluateFormula(config, q)
+      case PipeAnd(p, q) =>
+        val intermediateConfigs = getFinalConfigs(config, p)
+        if (intermediateConfigs.isEmpty) {
+          false
+        } else {
+          intermediateConfigs.exists(intermediateConfig => evaluateFormula(intermediateConfig, q))
+        }
+      case Or(p, q) => evaluateFormula(config, p) || evaluateFormula(config, q)
+      case Impl(p, q) => !evaluateFormula(config, p) || evaluateFormula(config, q)
+      case Iff(p, q) => evaluateFormula(config, p) == evaluateFormula(config, q)
+
+      case DiamondP(prog, p) =>
+        val finalConfigs = evaluateProgram(Set(config), prog)
+        finalConfigs.exists(finalConfig => evaluateFormula(finalConfig, p))
+
+      case BoxP(prog, p) =>
+        val finalConfigs = evaluateProgram(Set(config), prog)
+        finalConfigs.nonEmpty && finalConfigs.forall(finalConfig => evaluateFormula(finalConfig, p))
+
+      case Diamond(p) =>
+        RxSemantics.next(config).exists { case (_, nextConfig) => evaluateFormula(nextConfig, p) }
+
+      case Box(p) =>
+        RxSemantics.next(config).forall { case (_, nextConfig) => evaluateFormula(nextConfig, p) }
+    }
+  }
+
+  private def getFinalConfigs(config: RxGraph, formula: PdlFormula): Set[RxGraph] = {
+    formula match {
+      case DiamondP(prog, p) =>
+        val finalConfigsFromProg = evaluateProgram(Set(config), prog)
+        finalConfigsFromProg.filter(finalConfig => evaluateFormula(finalConfig, p))
+
+      case BoxP(prog, p) =>
+        val finalConfigsFromProg = evaluateProgram(Set(config), prog)
+        if (finalConfigsFromProg.forall(finalConfig => evaluateFormula(finalConfig, p))) {
+          finalConfigsFromProg
+        } else {
+          Set.empty
+        }
+      case PipeAnd(p, q) =>
+        val configsAfterP = getFinalConfigs(config, p)
+        configsAfterP.flatMap(intermediateConfig => getFinalConfigs(intermediateConfig, q))
+      case _ =>
+        if (evaluateFormula(config, formula)) Set(config) else Set.empty
+    }
+  }
+
+  def evaluateFormula(startState: QName, formula: PdlFormula, rx: RxGraph): Boolean = {
+    val initialConfig = rx
+    evaluateFormula(initialConfig, formula)
+  }
+}
+
+--- ARQUIVO: RxSemantics.scala ---
+Caminho: shared/src/main/scala/rta\backend\RxSemantics.scala
+------------------------------
+package rta.backend
+
+import rta.syntax.Program2.{ Edge, Edges, QName, RxGraph}
+import rta.syntax.{Condition, CounterUpdate, Statement, UpdateExpr, UpdateStmt, IfThenStmt}
+import rta.syntax.Program2.showEdge
+import rta.syntax.Program2.showEdges
+import scala.annotation.tailrec
+
+object RxSemantics {
+
+  def from(e: Edge, rx: RxGraph): Set[Edge] =
+    cascade(Set(e._4), Set())(using rx)
+
+  @tailrec
+  private def cascade(pendingLabels: Set[QName], doneEdges: Set[Edge])(using rx: RxGraph): Edges = {
+    if (pendingLabels.isEmpty) doneEdges
+    else {
+      val currentLabel = pendingLabels.head
+      val remainingLabels = pendingLabels.tail
+
+      val rulesOn = rx.on.getOrElse(currentLabel, Set.empty).map(t => (currentLabel, t._1, t._2, t._3))
+      val rulesOff = rx.off.getOrElse(currentLabel, Set.empty).map(t => (currentLabel, t._1, t._2, t._3))
+      
+      val allNewRules = (rulesOn ++ rulesOff).filter(rx.act.contains) -- doneEdges
+      
+      val newLabels = allNewRules.map(_._4).filter(_.n.nonEmpty)
+      cascade(remainingLabels ++ newLabels, doneEdges ++ allNewRules)
+    }
+  }
+
+  def toOnOff(e: Edge, rx: RxGraph): (Edges, Edges, Map[QName, Int]) = {
+    val (toA, toD, upds) = getHyperEdgeEffects(e, rx)
+    val nextEnv = applyUpdates(upds, rx)
+    (toA, toD, nextEnv)
+  }
+
+  private def getHyperEdgeEffects(e: Edge, rx: RxGraph): (Edges, Edges, List[Statement]) = {
+    val triggeredHyperEdges = from(e, rx)
+    var toActivate = Set.empty[Edge]
+    var toDeactivate = Set.empty[Edge]
+    var updatesToApply = List.empty[Statement]
+
+    for (hyperEdge <- triggeredHyperEdges) {
+      val (triggerLabel, targetLabel, ruleId, ruleLabel) = hyperEdge
+      
+      if (rx.act.contains(hyperEdge)) {
+        
+        val conditionHolds = rx.edgeConditions.getOrElse(hyperEdge, None) match {
+          case Some(cond) => Condition.evaluate(cond, rx.val_env)
+          case None => true
+        }
+
+        if (conditionHolds) {
+          updatesToApply = updatesToApply ::: rx.edgeUpdates.getOrElse(hyperEdge, Nil)
+
+          if (rx.on.getOrElse(triggerLabel, Set.empty).contains((targetLabel, ruleId, ruleLabel))) {
+            toActivate = toActivate ++ rx.lbls.getOrElse(targetLabel, Set.empty)
+          }
+          
+          if (rx.off.getOrElse(triggerLabel, Set.empty).contains((targetLabel, ruleId, ruleLabel))) {
+            toDeactivate = toDeactivate ++ rx.lbls.getOrElse(targetLabel, Set.empty)
+          }
+        }
+      }
+    }
+    (toActivate, toDeactivate, updatesToApply)
+  }
+
+
+  def applyUpdates(stmts: List[Statement], rx: RxGraph): Map[QName, Int] = {
+    def evaluateUpdateExpr(expr: UpdateExpr, env: Map[QName, Int]): Int = {
+      expr match {
+        case UpdateExpr.Lit(i) => i
+        case UpdateExpr.Var(q) => env.getOrElse(q, 0)
+        case UpdateExpr.Add(v, e) =>
+          val vVal = env.getOrElse(v, 0)
+          val eVal = e match { case Left(i) => i; case Right(q) => env.getOrElse(q, 0) }
+          vVal + eVal
+        case UpdateExpr.Sub(v, e) =>
+          val vVal = env.getOrElse(v, 0)
+          val eVal = e match { case Left(i) => i; case Right(q) => env.getOrElse(q, 0) }
+          vVal - eVal
+      }
+    }
+
+    val originalEnv = rx.val_env
+    var nextStateUpdates = Map[QName, Int]()
+
+    def processStatements(s_list: List[Statement]): Unit = {
+      for (stmt <- s_list) {
+        stmt match {
+          case UpdateStmt(upd) =>
+            val newValue = evaluateUpdateExpr(upd.expr, originalEnv)
+            nextStateUpdates += (upd.variable -> newValue)
+            
+          case IfThenStmt(condition, thenStmts) =>
+            if (Condition.evaluate(condition, originalEnv)) {
+              processStatements(thenStmts)
+            }
+        }
+      }
+    }
+
+    processStatements(stmts)
+    
+
+    originalEnv ++ nextStateUpdates
+  }
+
+  def nextEdge(rx: RxGraph): Set[(Edge, RxGraph)] =
+    (for
+      st <- rx.inits
+      (st2, tId, lbl) <- rx.edg.getOrElse(st, Set.empty)
+      edge: Edge = (st, st2, tId, lbl)
+      if rx.act.contains(edge)
+      if rx.edgeConditions.getOrElse(edge, None).forall(c => Condition.evaluate(c, rx.val_env))
+    yield
+      val (toAct, toDeact, hyperStmts) = getHyperEdgeEffects(edge, rx)
+      val allStatements = rx.edgeUpdates.getOrElse(edge, Nil) ++ hyperStmts
+
+      val finalValEnv = applyUpdates(allStatements, rx)
+
+      val newAct = (rx.act ++ toAct) -- toDeact
+      val newInits = (rx.inits - st) + st2
+
+      (edge, rx.copy(inits = newInits, act = newAct, val_env = finalValEnv))
+    ).toSet
+
+  def next[Name >: QName](rx: RxGraph): Set[(Name, RxGraph)] =
+    nextEdge(rx).map(e => e._1._4 -> e._2)
+}
+
+--- ARQUIVO: Translate2.scala ---
+Caminho: shared/src/main/scala/rta\backend\Translate2.scala
+------------------------------
+package rta.backend
+
+import rta.syntax.Program2.{RxGraph, QName, Edge}
+import rta.backend.RxSemantics
+import scala.collection.mutable
+
+object ExplicitTranslatorV4 {
+
+  def translate(root: RxGraph, modelName: String): String = {
+    val visited = mutable.Map[RxGraph, String]()
+    val queue = mutable.Queue[RxGraph]()
+    val allTransitions = mutable.ListBuffer[(String, String, String, String, String)]() 
+    
+    def getSafeName(g: RxGraph): String = {
+      val loc = g.inits.headOption.map(_.show).getOrElse("s")
+      val vars = g.val_env.toList.sortBy(_._1.show).map(_._2).mkString("")
+      s"${loc}_$vars"
+    }
+
+    queue.enqueue(root)
+    visited(root) = getSafeName(root)
+    val initialStateName = visited(root)
+
+    var edgeCount = 0
+    while (queue.nonEmpty) {
+      val current = queue.dequeue()
+      val currentName = visited(current)
+      val nextSteps = RxSemantics.nextEdge(current)
+      
+      for ((edge, nextGraph) <- nextSteps) {
+        if (!visited.contains(nextGraph)) {
+          visited(nextGraph) = getSafeName(nextGraph)
+          queue.enqueue(nextGraph)
+        }
+        edgeCount += 1
+        val targetName = visited(nextGraph)
+        val originalLabel = edge._4.show
+        val uniqueLabel = s"${originalLabel}_$currentName"
+        
+        allTransitions += ((currentName, targetName, s"t$edgeCount", uniqueLabel, originalLabel))
+      }
+    }
+
+    val sb = new StringBuilder()
+    sb.append(s"name ${modelName}_Explicit\n")
+    sb.append(s"init $initialStateName\n\n")
+
+
+    for ((from, to, id, uniqueLbl, originalLbl) <- allTransitions) {
+      val status = if (from == initialStateName) "" else "disabled"
+      sb.append(s"$from - $id -> $to : $uniqueLbl $status\n")
+    }
+
+    sb.append("\n// --- Reconfiguração baseada em Labels Únicas ---\n")
+
+
+    val transitionsBySource = allTransitions.groupBy(_._1)
+
+    for ((from, to, id, uniqueLbl, _) <- allTransitions) {
+      sb.append(s"// Ao realizar $uniqueLbl:\n")
+
+      transitionsBySource.getOrElse(from, Nil).foreach { case (_, _, _, lblToDisable, _) =>
+        val ruleLabel = s"deact_${uniqueLbl}_${lblToDisable}"
+        sb.append(s"$uniqueLbl --! $lblToDisable : $ruleLabel\n")
+      }
+
+      transitionsBySource.getOrElse(to, Nil).foreach { case (_, _, _, lblToEnable, _) =>
+        val ruleLabel = s"act_${uniqueLbl}_${lblToEnable}"
+        sb.append(s"$uniqueLbl ->> $lblToEnable : $ruleLabel\n")
+      }
+      sb.append("\n")
+    }
+
+    sb.toString()
+  }
+}
+
+--- ARQUIVO: Parser2.scala ---
+Caminho: shared/src/main/scala/rta\syntax\Parser2.scala
+------------------------------
+package rta.syntax
+
+import rta.syntax.Program2.{RxGraph, QName}
+import rta.syntax.{Condition, CounterUpdate, UpdateExpr, Statement, UpdateStmt, IfThenStmt}
+import rta.syntax.Condition.*
+import scala.util.matching.Regex
+
+object Parser2 {
+
+  private def tokenize(input: String): List[String] = {
+    // Removido 'clock' e 'inv' da lista de palavras-chave
+    val pattern = """(//.*)|(->>|--!|--x|--->|---->|--#--|->)|(\b(?:AND|OR|if|then|else|disabled|init|aut|int)\b)|(:=|==|!=|<=|>=|&&|\|\||[{}();,:=\+\-\*\/<>])|([a-zA-Z_][\w\.]*'?)|(-?\d+(\.\d+)?)""".r
+
+    pattern.findAllMatchIn(input).flatMap { m =>
+      if (m.group(1) != null) None 
+      else Some(m.matched)         
+    }.toList
+  }
+
+  private class TokenReader(tokens: List[String]) {
+    var pos = 0
+    
+    def current: String = if (pos < tokens.length) tokens(pos) else ""
+    def hasNext: Boolean = pos < tokens.length
+    
+    def consume(): String = {
+      val t = current
+      pos += 1
+      t
+    }
+    
+    def eat(s: String): Boolean = {
+      if (current == s) {
+        pos += 1
+        true
+      } else false
+    }
+    
+    def expect(s: String): Unit = {
+      if (!eat(s)) throw new RuntimeException(s"Syntax Error: Expected '$s', found '$current'")
+    }
+
+    def parseQName(): QName = {
+      val s = consume()
+      
+      if (s.isEmpty || s == ".") {
+        throw new RuntimeException(s"Syntax Error: Empty identifier found.")
+      }
+
+      val parts = s.split('.')
+      
+      for (part <- parts) {
+        if (part == "_") {
+          throw new RuntimeException(s"Syntax Error: '_' is not a valid name for an identifier.")
+        }
+
+        if (part.nonEmpty && part.head.isDigit) {
+          throw new RuntimeException(s"Syntax Error: Identifier '$part' cannot start with a digit.")
+        }
+
+        val invalidPattern = """[^a-zA-Z0-9_']""".r
+        if (invalidPattern.findFirstIn(part.replace("'", "")).isDefined) {
+          throw new RuntimeException(s"Syntax Error: Identifier '$part' contains invalid characters.")
+        }
+      }
+
+      if (s.contains(".")) QName(s.split('.').toList) else QName(List(s))
+    }
+    
+    def tryParseInt(): Int = consume().toInt
+    def tryParseDouble(): Double = consume().toDouble
+  }
+
+  def parseProgram(str: String): RxGraph = {
+    val tokens = tokenize(str)
+    val reader = new TokenReader(tokens)
+    parseBlock(reader)
+  }
+
+  private def parseBlock(reader: TokenReader): RxGraph = {
+    var rx = RxGraph()
+    
+    while (reader.hasNext && reader.current != "}") {
+      val token = reader.current
+      
+      if (reader.eat("init")) {
+        rx = rx.addInit(reader.parseQName())
+      }
+      else if (reader.eat("int")) {
+        val name = reader.parseQName()
+        reader.expect("=")
+        val value = reader.tryParseInt()
+        rx = rx.addVariable(name, value)
+      }
+      // Blocos 'clock' e 'inv' foram removidos daqui
+      else if (reader.eat("aut")) {
+        val name = reader.parseQName()
+        reader.expect("{")
+        val innerRx = parseBlock(reader)
+        reader.expect("}")
+        rx = rx ++ (name / innerRx)
+      }
+      else if (token == ";") {
+        reader.consume() 
+      }
+      else {
+        rx = parseEdge(reader, rx)
+      }
+      
+      reader.eat(";") 
+    }
+    rx
+  }
+
+  private def parseEdge(reader: TokenReader, rx: RxGraph): RxGraph = {
+    val from = reader.parseQName()
+    
+    var transId = QName(Nil)
+    var arrow = ""
+
+    if (reader.current == "-") {
+      reader.consume()
+      transId = reader.parseQName()
+      arrow = reader.consume()
+    } else if (reader.current == "--->") {
+      arrow = "->"
+      reader.consume()
+    } else {
+      arrow = reader.consume()
+    }
+
+    val to = reader.parseQName()
+    
+    var label = QName(Nil)
+    if (reader.eat(":")) {
+      label = reader.parseQName()
+    }
+
+    if (label.n.isEmpty) {
+      val mid = if (transId.n.nonEmpty) transId.show else "tau"
+      val generatedName = from.show + mid + to.show
+      label = QName(List(generatedName))
+    }
+
+    if (transId.n.isEmpty) {
+      transId = label
+    }
+
+    var cond: Option[Condition] = None
+    var updates: List[Statement] = Nil
+    var disabled = false
+
+    var parsingAttributes = true
+    while (parsingAttributes && reader.hasNext) {
+       val t = reader.current
+       
+       if (t == "disabled") {
+         reader.consume()
+         disabled = true
+       } 
+       else if (t == "if") {
+         reader.consume()
+         cond = Some(parseCondition(reader))
+         if (reader.eat("then")) {
+            reader.expect("{")
+            updates = parseStatementsBlock(reader)
+            reader.expect("}")
+         }
+       } 
+       else if (t.endsWith("'")) {
+           updates = updates :+ parseUpdate(reader)
+       } 
+       else {
+           parsingAttributes = false
+       }
+    }
+
+    val newRx = arrow match {
+      case "->" | "-->" => 
+        rx.addEdge(from, to, transId, label, cond, updates)
+      case "->>" => 
+        rx.addOn(from, to, transId, label, cond, updates)
+      case "--!" | "--x" => 
+        rx.addOff(from, to, transId, label, cond, updates)
+      case "---->" => 
+        rx.addOn(from, to, transId, label, cond, updates).addOff(to, to, transId, label, cond, updates)
+      case "--#--" => 
+        rx.addOff(from, to, transId, label, cond, updates).addOff(to, from, transId, label, cond, updates)
+      case _ => 
+        throw new RuntimeException(s"Unknown arrow: $arrow")
+    }
+
+    if (disabled) newRx.deactivate(from, to, transId, label) else newRx
+  }
+
+  private def parseCondition(reader: TokenReader): Condition = {
+    def parseAtom(): Condition = {
+      if (reader.eat("(")) {
+        val c = parseCondition(reader)
+        reader.expect(")")
+        c
+      } else {
+        val lhs = reader.parseQName()
+        val op = reader.consume()
+        val rhsToken = reader.current
+        // Mantido suporte a números decimais genéricos para variáveis 'int', 
+        // embora relógios não existam mais.
+        val rhs = if (rhsToken.matches("-?\\d+(\\.\\d+)?")) {
+             Left(reader.tryParseDouble())
+        } else {
+             Right(reader.parseQName())
+        }
+        AtomicCond(lhs, op, rhs)
+      }
+    }
+
+    var left = parseAtom()
+    while (reader.current == "AND" || reader.current == "&&" || reader.current == "OR" || reader.current == "||") {
+      val logicOp = reader.consume()
+      val right = parseAtom()
+      if (logicOp == "OR" || logicOp == "||") left = Or(left, right)
+      else left = And(left, right)
+    }
+    left
+  }
+
+  private def parseStatementsBlock(reader: TokenReader): List[Statement] = {
+    var stmts = List.empty[Statement]
+    while (reader.hasNext && reader.current != "}") {
+        if (reader.eat("if")) {
+            val cond = parseCondition(reader)
+            reader.expect("then")
+            reader.expect("{")
+            val inner = parseStatementsBlock(reader)
+            reader.expect("}")
+            stmts = stmts :+ IfThenStmt(cond, inner)
+        } else {
+            stmts = stmts :+ parseUpdate(reader)
+        }
+        reader.eat(";")
+    }
+    stmts
+  }
+
+  private def parseUpdate(reader: TokenReader): UpdateStmt = {
+      val vRaw = reader.parseQName()
+      if (!vRaw.n.last.endsWith("'")) throw new RuntimeException(s"Esperado var', encontrado ${vRaw.show}")
+      
+      val cleanName = QName(vRaw.n.init :+ vRaw.n.last.dropRight(1))
+      
+      reader.expect(":=")
+      
+      val firstToken = reader.consume()
+      val expr = if (firstToken.matches("-?\\d+")) UpdateExpr.Lit(firstToken.toInt) else UpdateExpr.Var(stringToQName(firstToken))
+      
+      if (reader.current == "+" || reader.current == "-") {
+          val op = reader.consume()
+          val secondToken = reader.consume()
+          val rhs = if (secondToken.matches("-?\\d+")) Left(secondToken.toInt) else Right(stringToQName(secondToken))
+          
+          val varFromExpr = expr match {
+              case UpdateExpr.Var(q) => q
+              case _ => throw new RuntimeException("Expressão complexa não suportada no parser simples")
+          }
+          
+          if (op == "+") UpdateStmt(CounterUpdate(cleanName, UpdateExpr.Add(varFromExpr, rhs)))
+          else UpdateStmt(CounterUpdate(cleanName, UpdateExpr.Sub(varFromExpr, rhs)))
+      } else {
+          UpdateStmt(CounterUpdate(cleanName, expr))
+      }
+  }
+
+  private def stringToQName(s: String): QName = {
+      if (s.contains(".")) QName(s.split('.').toList) else QName(List(s))
+  }
+
+  def pp[A](parser: Any, str: String): Either[String, A] = {
+      try { Right(stringToQName(str).asInstanceOf[A]) } catch { case e: Throwable => Left(e.getMessage) }
+  }
+  def qname: Any = null
+}
+
+--- ARQUIVO: PdlParser.scala ---
+Caminho: shared/src/main/scala/rta\syntax\PdlParser.scala
+------------------------------
+package rta.syntax
+
+import rta.syntax.Formula.*
+import rta.syntax.PdlProgram.*
+import rta.syntax.Program2.QName
+import rta.syntax.Condition
+import scala.util.matching.Regex
+
+object PdlParser {
+
+  def parsePdlFormula(str: String): Formula = {
+    val tokens = tokenize(str)
+    if (tokens.isEmpty) throw new RuntimeException("Formula cannot be empty")
+    val reader = new TokenReader(tokens)
+    val formula = parseFormula(reader)
+    if (reader.hasNext) throw new RuntimeException(s"Tokens inesperados no fim: ${reader.current}")
+    formula
+  }
+
+  private def tokenize(input: String): List[String] = {
+    val pattern = """(<->|->|=>|&&|\|\||&\|&|\[\]|<>|==|!=|<=|>=|[!~\[\]\(\)\{\};\+\*<>:]|[a-zA-Z_][\w\.]*(\/[a-zA-Z_][\w\.]*)*|-?\d+(\.\d+)?)""".r
+    //"""(<->|->|=>|&&|\|\||&\|&|\[\]|<>|==|!=|<=|>=|[!~\[\]\(\)\{\};\+\*<>]|[a-zA-Z_][\w\.]*(\/[a-zA-Z_][\w\.]*)*|-?\d+(\.\d+)?)""".r
+    pattern.findAllIn(input).toList
+  }
+
+  private class TokenReader(tokens: List[String]) {
+    var pos = 0
+    def current: String = if (pos < tokens.length) tokens(pos) else ""
+    def hasNext: Boolean = pos < tokens.length
+    def consume(): String = { val t = current; pos += 1; t }
+    def eat(s: String): Boolean = if (current == s) { pos += 1; true } else false
+    def expect(s: String): Unit = if (!eat(s)) throw new RuntimeException(s"Esperado '$s', encontrado '$current'")
+  }
+
+
+  private def parseFormula(reader: TokenReader): Formula = parseIff(reader)
+
+  private def parseIff(reader: TokenReader): Formula = {
+    var left = parseImpl(reader)
+    while (reader.current == "<->") {
+      reader.consume()
+      val right = parseImpl(reader)
+      left = Iff(left, right)
+    }
+    left
+  }
+
+  private def parseImpl(reader: TokenReader): Formula = {
+    var left = parseOr(reader)
+    if (reader.current == "->" || reader.current == "=>") {
+      reader.consume()
+      val right = parseImpl(reader) 
+      left = Impl(left, right)
+    }
+    left
+  }
+
+  private def parseOr(reader: TokenReader): Formula = {
+    var left = parseAnd(reader)
+    while (reader.current == "||" || reader.current == "OR") {
+      reader.consume()
+      val right = parseAnd(reader)
+      left = Or(left, right)
+    }
+    left
+  }
+
+  private def parseAnd(reader: TokenReader): Formula = {
+    var left = parsePipeAnd(reader)
+    while (reader.current == "&&" || reader.current == "AND") {
+      reader.consume()
+      val right = parsePipeAnd(reader)
+      left = And(left, right)
+    }
+    left
+  }
+
+  private def parsePipeAnd(reader: TokenReader): Formula = {
+    var left = parseUnary(reader)
+    while (reader.current == "&|&") {
+      reader.consume()
+      val right = parseUnary(reader)
+      left = PipeAnd(left, right)
+    }
+    left
+  }
+
+  private def parseUnary(reader: TokenReader): Formula = {
+    val t = reader.current
+    if (t == "!" || t == "~" || t == "¬") {
+      reader.consume()
+      Not(parseUnary(reader))
+    } else if (t == "[]") {
+      reader.consume()
+      Box(parseUnary(reader))
+    } else if (t == "<>") {
+      reader.consume()
+      Diamond(parseUnary(reader))
+    } else if (t == "[") {
+      val savePos = reader.pos
+      try {
+          reader.consume() // [
+          val cond = parseCondition(reader)
+          reader.expect("]")
+          CondProp(cond)
+      } catch {
+          case _: Throwable =>
+              reader.pos = savePos
+              reader.consume() // [
+              val prog = parseProgram(reader)
+              reader.expect("]")
+              val f = parseUnary(reader)
+              BoxP(prog, f)
+      }
+    } else if (t == "<") {
+      reader.consume()
+      val prog = parseProgram(reader)
+      reader.expect(">")
+      val f = parseUnary(reader)
+      DiamondP(prog, f)
+    } else {
+      parseAtom(reader)
+    }
+  }
+
+  private def parseAtom(reader: TokenReader): Formula = {
+    if (reader.eat("(")) {
+      val f = parseFormula(reader)
+      reader.expect(")")
+      f
+    } else if (reader.current == "true") {
+      reader.consume()
+      True
+    } else if (reader.current == "false") {
+      reader.consume()
+      False
+    } else {
+      StateProp(parseQName(reader))
+    }
+  }
+
+  
+  private def parseProgram(reader: TokenReader): PdlProgram = parseChoice(reader)
+
+  private def parseChoice(reader: TokenReader): PdlProgram = {
+    var left = parseSeq(reader)
+    while (reader.eat("+")) {
+      val right = parseSeq(reader)
+      left = Choice(left, right)
+    }
+    left
+  }
+
+  private def parseSeq(reader: TokenReader): PdlProgram = {
+    var left = parseStar(reader)
+    while (reader.eat(";")) {
+      val right = parseStar(reader)
+      left = Seq(left, right)
+    }
+    left
+  }
+
+  private def parseStar(reader: TokenReader): PdlProgram = {
+    var prog = parseProgAtom(reader)
+    while (reader.eat("*")) {
+      prog = Star(prog)
+    }
+    prog
+  }
+
+  /*private def parseProgAtom(reader: TokenReader): PdlProgram = {
+    if (reader.eat("(")) {
+      val p = parseProgram(reader)
+      reader.expect(")")
+      p
+    } else {
+      Act(parseQName(reader))
+    }
+  }*/
+
+  private def parseProgAtom(reader: TokenReader): PdlProgram = {
+    if (reader.eat("(")) {
+      val p = parseProgram(reader)
+      reader.expect(")")
+      p
+    } else {
+      val name = parseQName(reader)
+      
+      if (reader.current == ":") {
+        reader.consume() 
+        val value = reader.consume()
+        Act(name / value) 
+      } 
+      else if (reader.current == "(") {
+        reader.consume()
+        val id = parseQName(reader)
+        reader.expect(")")
+        Act(name / id) 
+      }
+      else {
+        Act(name)
+      }
+    }
+  }
+
+  private def parseQName(reader: TokenReader): QName = {
+    val s = reader.consume()
+    if (s.contains("/")) QName(s.split('/').toList)
+    else QName(s.split('.').toList)
+  }
+
+  private def parseCondition(reader: TokenReader): Condition = {
+      val lhs = parseQName(reader)
+      val op = reader.consume()
+      
+      val validOps = Set("==", "!=", "<=", ">=", "<", ">")
+      
+      if (!validOps.contains(op)) {
+          throw new RuntimeException(s"Operador de condição inválido: $op")
+      }
+      
+      val rhsToken = reader.consume()
+      val rhs = if (rhsToken.matches("-?\\d+(\\.\\d+)?")) Left(rhsToken.toDouble) else Right(parseQNameDummy(rhsToken))
+      Condition.AtomicCond(lhs, op, rhs)
+  }
+  
+  private def parseQNameDummy(s: String): QName = {
+      if (s.contains("/")) QName(s.split('/').toList) else QName(s.split('.').toList)
+  }
+}
+
+--- ARQUIVO: PdlProgram.scala ---
+Caminho: shared/src/main/scala/rta\syntax\PdlProgram.scala
+------------------------------
+package rta.syntax
+import rta.syntax.Program2.QName
+
+sealed trait PdlProgram
+object PdlProgram {
+  case class Act(name: QName) extends PdlProgram                  // a
+  case class Seq(p: PdlProgram, q: PdlProgram) extends PdlProgram        // p ; q
+  case class Choice(p: PdlProgram, q: PdlProgram) extends PdlProgram     // p + q
+  case class Star(p: PdlProgram) extends PdlProgram                   // p*
+}
+
+
+--- ARQUIVO: PdlSyntax.scala ---
+Caminho: shared/src/main/scala/rta\syntax\PdlSyntax.scala
+------------------------------
+package rta.syntax
+import rta.syntax.PdlProgram
+import rta.syntax.Program2.QName
+import rta.syntax.Condition.*
+
+
+
+sealed trait Formula
+object Formula {
+  case object True extends Formula
+  case object False extends Formula
+  case class StateProp(name: QName) extends Formula      // Representa uma verificação de estado, ex: "s1"
+  case class CondProp(cond: Condition) extends Formula // Representa uma verificação de condição, ex: "[c < 2]"
+  case class Not(p: Formula) extends Formula
+  case class And(p: Formula, q: Formula) extends Formula
+  case class Or(p: Formula, q: Formula) extends Formula
+  case class Impl(p: Formula, q: Formula) extends Formula
+  case class Iff(p: Formula, q: Formula) extends Formula
+
+  case class PipeAnd(p: Formula, q: Formula) extends Formula // Nosso novo operador '&|&'
+  case class Box(p: Formula) extends Formula
+  case class Diamond(p: Formula) extends Formula
+
+
+  case class BoxP(act: PdlProgram, p: Formula) extends Formula      // [α]φ
+  case class DiamondP(act: PdlProgram, p: Formula) extends Formula  // <α>φ
+
+  
+
+
+
+}
+
+
+--- ARQUIVO: Program2.scala ---
+Caminho: shared/src/main/scala/rta\syntax\Program2.scala
+------------------------------
+package rta.syntax
+
+import rta.backend.RxSemantics
+import rta.syntax.Program2.EdgeMap
+import rta.syntax.{Condition, CounterUpdate, UpdateExpr, Statement, UpdateStmt, IfThenStmt}
+import scala.annotation.tailrec
+import scala.language.implicitConversions
+
+object Program2:
+
+  type Rel[A,B] = Map[A,Set[B]]
+  def empty[A,B] = Map[A,Set[B]]().withDefaultValue(Set())
+  def add[A,B](ab:(A,B), r:Rel[A,B]) = r + (ab._1 -> (r(ab._1)+(ab._2)))
+  def join[A,B](r1:Rel[A,B], r2:Rel[A,B]) = r1 ++ (r2.map(ab => ab._1 -> (r1(ab._1)++(ab._2))))
+
+  private def isGlobalControlVar(q: QName): Boolean = q.n.mkString.contains("_")
+
+  case class QName(n:List[String]):
+    override def toString = n.mkString("/")
+    def show = if n.isEmpty then "-" else toString
+    def /(other:QName) = if (other.n.isEmpty) other else if (n.isEmpty) other else QName(n ::: other.n)
+    def /(other:String) = QName(n:::List(other))
+
+    def /(e:EdgeMap):EdgeMap =
+      e.map((src, targets) => (this / src) -> targets.map((to, id, lbl) => (this / to, this / id, this / lbl)))
+
+    def /(es:Edges): Edges =
+      es.map((src, to, id, lbl) => (this / src, this / to, this / id, this / lbl))
+
+    def /-(lblsMap:Map[QName,Edges]): Map[QName,Edges] =
+      lblsMap.map((lbl, edges) => (this / lbl) -> (this / edges))
+
+    def /-(ns:Set[QName]): Set[QName] =
+      ns.map(n => this / n)
+    
+    def scope: QName = if n.isEmpty then this else QName(n.init)
+
+    def /(rx: RxGraph): RxGraph =
+      rx.copy( 
+        edg = this / rx.edg,
+        on = this / rx.on,
+        off = this / rx.off,
+        lbls = this /- rx.lbls,
+        inits = this /- rx.inits,
+        act = this / rx.act,
+        val_env = rx.val_env.map { case (k, v) => (this / k) -> v },
+        edgeConditions = rx.edgeConditions.map { case (edge, condOpt) =>
+          (this / edge._1, this / edge._2, this / edge._3, this / edge._4) -> condOpt.map(c => applyPrefixToCondition(this, c))
+        },
+        edgeUpdates = rx.edgeUpdates.map { case (edge, stmtList) =>
+          (this / edge._1, this / edge._2, this / edge._3, this / edge._4) -> stmtList.map(stmt => applyPrefixToStatement(this, stmt))
+        }
+      )
+  
+  def applyPrefixToCondition(prefix: QName, cond: Condition): Condition = {
+    cond match {
+      case Condition.AtomicCond(left, op, right) =>
+        val newLeft = if (isGlobalControlVar(left)) left else prefix / left
+        val newRight = right match {
+          case Left(i) => Left(i)
+          case Right(q) => if (isGlobalControlVar(q)) Right(q) else Right(prefix / q)
+        }
+        Condition.AtomicCond(newLeft, op, newRight)
+      case Condition.And(l, r) => Condition.And(applyPrefixToCondition(prefix, l), applyPrefixToCondition(prefix, r))
+      case Condition.Or(l, r) => Condition.Or(applyPrefixToCondition(prefix, l), applyPrefixToCondition(prefix, r))
+    }
+  }
+
+  def applyPrefixToStatement(prefix: QName, stmt: Statement): Statement = {
+    stmt match {
+      case UpdateStmt(upd) =>
+        val newVar = if (isGlobalControlVar(upd.variable)) upd.variable else prefix / upd.variable
+        val newExpr = upd.expr match {
+            case UpdateExpr.Add(v, e) => UpdateExpr.Add(if(isGlobalControlVar(v)) v else prefix/v, e match {
+                case Right(q) if !isGlobalControlVar(q) => Right(prefix/q)
+                case other => other
+            })
+            case UpdateExpr.Sub(v, e) => UpdateExpr.Sub(if(isGlobalControlVar(v)) v else prefix/v, e match {
+                case Right(q) if !isGlobalControlVar(q) => Right(prefix/q)
+                case other => other
+            })
+            case UpdateExpr.Var(q) if !isGlobalControlVar(q) => UpdateExpr.Var(prefix/q)
+            case other => other
+        }
+        UpdateStmt(upd.copy(variable = newVar, expr = newExpr))
+      case IfThenStmt(cond, thenStmts) =>
+        IfThenStmt(
+          applyPrefixToCondition(prefix, cond),
+          thenStmts.map(s => applyPrefixToStatement(prefix, s))
+        )
+    }
+  }
+
+  type Edge = (QName, QName, QName, QName)
+  type Edges = Set[Edge]
+  type EdgeMap = Rel[QName, (QName, QName, QName)]
+
+  def showEdge(e: Edge): String = {
+    val (from, to, transId, label) = e
+    if (transId == label) {
+      s"${from.show} ---> ${to.show} : ${label.show}"
+    } else {
+      s"${from.show} -${transId.show}-> ${to.show} : ${label.show}"
+    }
+  }
+  def showEdges(abc:Edges): String =
+    abc.map(showEdge).mkString(", ")
+
+  private def showEdgeMap(abc:EdgeMap): String =
+    val es = for (a, bcs) <- abc.toSet; (b, id, lbl) <- bcs yield (a, b, id, lbl)
+    showEdges(es)
+
+
+  case class RxGraph(edg:EdgeMap,
+                     on:EdgeMap, off: EdgeMap,
+                     lbls: Map[QName,Edges],
+                     inits: Set[QName],
+                     act: Edges,
+                     val_env: Map[QName, Int], 
+                     edgeConditions: Map[Edge, Option[Condition]], 
+                     edgeUpdates: Map[Edge, List[Statement]] 
+                    ):
+
+    def showSimple: String =
+      s"[at] ${inits.mkString(",")}" +
+      s"${if val_env.nonEmpty then s" [vars] ${val_env.map(kv => s"${kv._1}=${kv._2}").mkString(", ")}" else ""}" +
+      s" [active] ${showEdges(act)}"
+
+    override def toString: String =
+      s"""[init]  ${inits.mkString(",")}
+         |[vars]  ${val_env.map(kv => s"${kv._1}=${kv._2}").mkString(", ")}
+         |[act]   ${showEdges(act)}
+         |[edges] ${showEdgeMap(edg)}
+         |[on]    ${showEdgeMap(on)}
+         |[off]   ${showEdgeMap(off)}
+         |[conds] ${edgeConditions.filter(_._2.isDefined).map(kv => s"${showEdge(kv._1)} -> ${kv._2.get.toMermaidString}").mkString(", ")}
+         |[upd]   ${edgeUpdates.filter(_._2.nonEmpty).map(kv => s"${showEdge(kv._1)} -> ${kv._2.map(_.toString).mkString("; ")}").mkString(", ")}"""
+    
+    def states =
+      for (src, dests) <- edg.toSet; (d, _, _) <- dests; st <- Set(src, d) yield st
+
+    def addEdge(s1:QName, s2:QName, transId:QName, label:QName, cond: Option[Condition] = None, upd: List[Statement] = Nil) = {
+      val edge: Edge = (s1, s2, transId, label)
+      this.copy(
+        edg = add(s1 -> (s2, transId, label), edg), 
+        lbls = add(label -> edge, lbls),           
+        act = act + edge,
+        edgeConditions = edgeConditions + (edge -> cond),
+        edgeUpdates = edgeUpdates + (edge -> upd)
+      )
+    }
+
+    def addOn(s1: QName, s2: QName, tId: QName, l: QName, cond: Option[Condition] = None, upd: List[Statement] = Nil) = {
+      val edge: Edge = (s1, s2, tId, l)
+      this.copy(
+        on = add(s1 -> (s2, tId, l), on),
+        lbls = add(l -> edge, lbls),
+        act = act + edge,
+        edgeConditions = edgeConditions + (edge -> cond),
+        edgeUpdates = edgeUpdates + (edge -> upd))
+    }
+
+    def addOff(s1: QName, s2: QName, tId: QName, l: QName, cond: Option[Condition] = None, upd: List[Statement] = Nil) = {
+      val edge: Edge = (s1, s2, tId, l)
+      this.copy(
+        off = add(s1 -> (s2, tId, l), off),
+        lbls = add(l -> edge, lbls),
+        act = act + edge,
+        edgeConditions = edgeConditions + (edge -> cond),
+        edgeUpdates = edgeUpdates + (edge -> upd))
+    }
+
+    def deactivate(s1:QName, s2:QName, tId:QName, l:QName) =
+      this.copy(act = act - ((s1, s2, tId, l)))
+
+    def addInit(s:QName) =
+      this.copy(inits = inits + s)
+
+    def addVariable(name: QName, value: Int) =
+      this.copy(val_env = val_env + (name -> value))
+
+    def ++(r:RxGraph) =
+      RxGraph(
+        join(edg,r.edg),join(on,r.on),join(off,r.off),
+        join(lbls,r.lbls),inits++r.inits,act++r.act,
+        val_env ++ r.val_env, 
+        edgeConditions ++ r.edgeConditions, 
+        edgeUpdates ++ r.edgeUpdates 
+      )
+
+
+  object RxGraph: 
+    def apply(): RxGraph = RxGraph(
+      Map().withDefaultValue(Set()),Map().withDefaultValue(Set()),
+      Map().withDefaultValue(Set()),Map().withDefaultValue(Set()),Set(),Set(),
+      Map(), Map().withDefaultValue(None), Map().withDefaultValue(Nil))
+
+    def toMermaid(rx: RxGraph): String =
+      var i = -1
+      def fresh(): Int = {i += 1; i}
+      s"flowchart LR\n${
+        drawEdges(rx.edg, rx, fresh, ">", "stroke:black, stroke-width:2px",(x,y) => Set(x.toString), withConditions = true)}${
+        drawEdges(rx.on, rx, fresh, ">", "stroke:blue, stroke-width:3px",getLabel, withConditions = true)}${
+        drawEdges(rx.off,rx, fresh, "x", "stroke:red, stroke-width:3px",getLabel, withConditions = true)}${
+        (for s<-rx.inits yield s"  style $s fill:#8f7,stroke:#363,stroke-width:4px\n").mkString
+      }"
+
+    def toMermaidPlain(rx: RxGraph): String =
+      var i = -1
+      def fresh(): Int = {i += 1; i}
+      s"flowchart LR\n${
+        drawEdges(rx.edg, rx, fresh, ">", "stroke:black, stroke-width:2px",(x,y) => Set(x.toString),simple=true, withConditions = false)}${
+        (for s<-rx.inits yield s"  style $s fill:#8f7,stroke:#363,stroke-width:4px\n").mkString 
+      }"
+
+    private def getLabel(n: QName, rx: RxGraph): Set[String] =
+      for (edge <- rx.lbls.getOrElse(n, Set())) 
+        yield cleanId(edge._1, edge._2, edge._3, edge._4)
+    
+    private def cleanId(a: Any, b: Any, id: Any, lbl: Any): String =
+      s"$a$b$id$lbl".replaceAll("[^a-zA-Z0-9]", "")
+
+    private def drawEdges(
+      es: EdgeMap,
+      rx: RxGraph,
+      fresh: () => Int,
+      tip: String,
+      style: String,
+      getEnds: (QName, RxGraph) => Set[String],
+      simple: Boolean = false,
+      withConditions: Boolean = false
+    ): String =
+      (for
+        (a, bs) <- es.toList
+        (b, transId, lbl) <- bs.toList
+        a2 <- getEnds(a, rx).toList
+        b2 <- getEnds(b, rx).toList
+      yield
+        val edge: Edge = (a, b, transId, lbl)
+
+        val isGloballyActive = rx.act(edge)
+        val isConditionSatisfied = rx.edgeConditions.getOrElse(edge, None) match {
+          case None => true 
+          case Some(condition) => Condition.evaluate(condition, rx.val_env)
+        }
+
+        val line = if (isGloballyActive && isConditionSatisfied) then "---" else "-.-"
+
+        val qNameLabel = if transId == lbl then lbl.show else s"${lbl.show}(${transId.show})"
+        val updList = rx.edgeUpdates.getOrElse(edge, Nil)
+        val updText = if (withConditions && updList.nonEmpty)  s"{ ${updList.map(_.toMermaidString).mkString("; ")} }"  else ""
+
+        val condOpt = rx.edgeConditions.get(edge).flatten
+        val condText = if (withConditions && condOpt.isDefined)  s"[${condOpt.get.toMermaidString}]"  else ""
+        val combined = List(condText, qNameLabel, updText).filter(_.nonEmpty).mkString(" ")
+
+        
+        val edgeLabel = if combined.nonEmpty then s"|\"${combined}\"|" else ""
+
+        if lbl.n.isEmpty && transId.n.isEmpty then
+          s"  $a2 $line$tip $edgeLabel $b2\n" +
+          s"  linkStyle ${fresh()} $style\n"
+        else if simple then
+          s"  $a2 $line$tip $edgeLabel $b2\n" +
+          s"  linkStyle ${fresh()} $style\n"
+        else
+          val anchorId = cleanId(a, b, transId, lbl)
+          s"  $a2 $line $anchorId( ) $line$tip $edgeLabel $b2\n" +
+          s"  style $anchorId width: 0\n" +
+          s"  linkStyle ${fresh()} $style\n" +
+          s"  linkStyle ${fresh()} $style\n"
+      ).mkString
+
+  object Examples:
+    implicit def s2n(str:String): QName = QName(List(str))
+    val a = s2n("a")
+    val t1 = s2n("t1")
+    val s1 = s2n("s1")
+    val s2 = s2n("s2")
+
+    val g1 = RxGraph()
+      .addInit(s1)
+      .addEdge(s1, s2, t1, a)
+      .addOff(a, a, s2n("rule1"), s2n("off-a"))
+
+    val counter = RxGraph()
+      .addInit("0")
+      .addEdge("0", "0", "t_act", "act")
+      .addOff("act", "act", "r1", "offAct")
+      .deactivate("act", "act", "r1", "offAct")
+      .addOn("act", "offAct", "r2", "on1")
+      .deactivate("act", "offAct", "r2", "on1")
+      .addOn("act", "on1", "r3", "on2")
+
+--- ARQUIVO: SyntaxElements.scala ---
+Caminho: shared/src/main/scala/rta\syntax\SyntaxElements.scala
+------------------------------
+package rta.syntax
+import rta.syntax.Program2.QName
+
+sealed trait Statement {
+  def toMermaidString: String
+}
+case class UpdateStmt(update: CounterUpdate) extends Statement {
+  def toMermaidString: String = update.toString 
+}
+case class IfThenStmt(condition: Condition, thenStmts: List[Statement]) extends Statement {
+  def toMermaidString: String = 
+    s"if ${condition.toMermaidString} then { ${thenStmts.map(_.toMermaidString).mkString("; ")} }"
+}
+
+sealed trait Condition {
+  def toMermaidString: String = this match {
+    case Condition.AtomicCond(left, op, Right(q)) => s"${left.show} $op ${q.show}"
+    case Condition.AtomicCond(left, op, Left(i)) => s"${left.show} $op $i"
+    case Condition.And(c1, c2) => s"(${c1.toMermaidString} AND ${c2.toMermaidString})"
+    case Condition.Or(c1, c2) => s"(${c1.toMermaidString} OR ${c2.toMermaidString})"
+  }
+}
+
+object Condition {
+  case class AtomicCond(left: QName, op: String, right: Either[Double, QName]) extends Condition
+  case class And(left: Condition, right: Condition) extends Condition
+  case class Or(left: Condition, right: Condition) extends Condition
+
+  private def getValue(qname: QName, val_env: Map[QName, Int]): Double = {
+    val_env.get(qname).map(_.toDouble)
+      .getOrElse {
+        if (qname.n.size > 1) {
+          val globalName = QName(List(qname.n.last))
+          val_env.getOrElse(globalName, 0).toDouble
+        } else {
+          0.0
+        }
+      }
+  }
+
+  def evaluate(condition: Condition, val_env: Map[QName, Int]): Boolean = condition match {
+    case AtomicCond(left, op, right) =>
+      val leftVal = getValue(left, val_env)
+      val rightVal = right match {
+        case Left(d) => d
+        case Right(qname) => getValue(qname, val_env)
+      }
+      op match {
+        case ">=" => leftVal >= rightVal
+        case "<=" => leftVal <= rightVal
+        case ">"  => leftVal > rightVal
+        case "<"  => leftVal < rightVal
+        case "==" => leftVal == rightVal
+        case "!=" => leftVal != rightVal
+        case _    => false
+      }
+    case And(l, r) => evaluate(l, val_env) && evaluate(r, val_env)
+    case Or(l, r) => evaluate(l, val_env) || evaluate(r, val_env)
+  }
+}
+
+sealed trait UpdateExpr
+object UpdateExpr {
+  case class Lit(i: Int) extends UpdateExpr
+  case class Var(q: QName) extends UpdateExpr
+  case class Add(v: QName, e: Either[Int, QName]) extends UpdateExpr
+  case class Sub(v: QName, e: Either[Int, QName]) extends UpdateExpr
+
+  def show(expr: UpdateExpr): String = expr match {
+    case Lit(i) => i.toString
+    case Var(q) => q.show
+    case Add(v, Left(i)) => s"${v.show} + $i"
+    case Add(v, Right(q)) => s"${v.show} + ${q.show}"
+    case Sub(v, Left(i)) => s"${v.show} - $i"
+    case Sub(v, Right(q)) => s"${v.show} - ${q.show}"
+  }
+
+  def show(expr: UpdateExpr, s: QName => String): String = expr match {
+    case Lit(i) => i.toString
+    case Var(q) => s(q)
+    case Add(v, Left(i)) => s"${s(v)} + $i"
+    case Add(v, Right(q)) => s"${s(v)} + ${s(q)}"
+    case Sub(v, Left(i)) => s"${s(v)} - $i"
+    case Sub(v, Right(q)) => s"${s(v)} - ${s(q)}"
+  }
+}
+
+case class CounterUpdate(variable: QName, expr: UpdateExpr) {
+  override def toString: String = s"${variable.show}' := ${UpdateExpr.show(expr)}"
+}
+
+--- ARQUIVO: Translate.scala ---
+Caminho: shared/src/main/scala/rta\syntax\Translate.scala
+------------------------------
+package rta.syntax
+
+import rta.syntax.Program2.{Edge, QName, RxGraph}
+import rta.syntax.{Condition, Statement, UpdateStmt, IfThenStmt, UpdateExpr}
+
+object RTATranslator {
+
+  private case class Effect(effectType: String, targetLabel: QName, ruleId: QName, ruleLabel: QName, originalTrigger: QName)
+
+  private def isPhantomRule(trigger: QName, ruleLabel: QName): Boolean = {
+    ruleLabel.n.nonEmpty && ruleLabel.n == trigger.n.init
+  }
+
+  def translate_syntax(stx: RxGraph, inputScript: String): String = {
+    if (inputScript.linesIterator.exists(_.trim.startsWith("aut "))) {
+      translateModular(stx, inputScript)
+    } else {
+      translateFlat(stx, inputScript)
+    }
+  }
+
+  private def translateFlat(stx: RxGraph, inputScript: String): String = {
+    val builder = new StringBuilder()
+    val originalLines = inputScript.split('\n')
+
+    val ruleToLineNumber = {
+      val lineMap = collection.mutable.Map[(String, QName, QName, QName), Int]()
+      // Regex que suporta opcionalmente o ID: trigger [- id] (->>|--!) target [: rlabel]
+      val ruleRegex = """^\s*([\w./]+)\s*(?:-\s*([\w./]+)\s*)?(->>|--!)\s*([\w./]+)(?:\s*:\s*([\w./]+))?.*""".r
+      originalLines.zipWithIndex.foreach { case (line, lineNumber) =>
+        ruleRegex.findFirstMatchIn(line.trim).foreach { m =>
+          val trigger = QName(m.group(1).split('/').toList)
+          val op = m.group(3)
+          val target = QName(m.group(4).split('/').toList)
+          val rlabelRaw = m.group(5)
+          val ruleLabel = if (rlabelRaw != null) QName(rlabelRaw.split('/').toList) else target
+          val effectType = if (op == "->>") "on" else "off"
+          lineMap((effectType, trigger, target, ruleLabel)) = lineNumber
+        }
+      }
+      lineMap.toMap
+    }
+
+    val allEdgeLabels = stx.lbls.keySet
+    builder.append("// Control variables for group activation\n")
+    for (label <- allEdgeLabels.toList.sortBy(_.toString) if label.n.nonEmpty) {
+      val isInitiallyActive = stx.lbls.get(label).exists(_.exists(stx.act.contains))
+      builder.append(s"int ${sanitizeForVar(label)}_active = ${if (isInitiallyActive) 1 else 0}\n")
+    }
+
+    builder.append("\n// Declarations\n")
+    originalLines.foreach { line =>
+      val trim = line.trim
+      if (trim.startsWith("int ") || trim.startsWith("init ") ) {
+        if (!trim.contains("_active =")) builder.append(line).append("\n")
+      }
+    }
+
+    builder.append("\n// --- Translated Edges ---\n")
+
+    for ((source, targets) <- stx.edg; (target, transId, label) <- targets) {
+      val simpleEdge: Edge = (source, target, transId, label)
+      val bodyBuilder = new StringBuilder()
+
+      stx.edgeUpdates.get(simpleEdge).foreach { updates =>
+        updates.foreach(stmt => bodyBuilder.append(s"    ${statementToString(stmt)}\n"))
+      }
+
+      val allEffects = findAllTriggeredEffects(label, stx)
+      val sortedEffects = allEffects.sortBy { effect =>
+          val key = (effect.effectType, effect.originalTrigger, effect.targetLabel, effect.ruleLabel)
+          ruleToLineNumber.getOrElse(key, Int.MaxValue)
+      }
+      
+      if (sortedEffects.nonEmpty && bodyBuilder.nonEmpty) bodyBuilder.append("\n")
+
+      for (effect <- sortedEffects) {
+        val hyperEdge = (effect.originalTrigger, effect.targetLabel, effect.ruleId, effect.ruleLabel)
+        val conditionOpt = stx.edgeConditions.get(hyperEdge).flatten
+
+        val updateStatement = if (effect.effectType == "on") s"${sanitizeForVar(effect.targetLabel)}_active' := 1" else s"${sanitizeForVar(effect.targetLabel)}_active' := 0"
+        bodyBuilder.append(s"    // Rule from group ${effect.originalTrigger.show}\n")
+
+        val guardParts = collection.mutable.ListBuffer[String]()
+        if (effect.ruleLabel.n.nonEmpty) guardParts += s"${sanitizeForVar(effect.ruleLabel)}_active == 1"
+        conditionOpt.foreach(cond => guardParts += s"(${conditionToString(cond)})")
+        
+        if (guardParts.isEmpty) builder.append("") // Noop
+        
+        if (guardParts.isEmpty) {
+          bodyBuilder.append(s"    $updateStatement\n")
+        } else {
+          bodyBuilder.append(s"    if (${guardParts.mkString(" AND ")}) then {\n        $updateStatement\n    }\n")
+        }
+      }
+
+      val edgeDefinition = s"${source.show} - ${transId.show} -> ${target.show} : ${label.show}"
+      val mainGuard = if (label.n.nonEmpty) s"if (${sanitizeForVar(label)}_active == 1" else "if (true"
+      val originalGuard = stx.edgeConditions.get(simpleEdge).flatten.map(c => " AND " + conditionToString(c)).getOrElse("")
+      val fullGuardClause = mainGuard + originalGuard + ")"
+      
+      if (bodyBuilder.toString.trim.isEmpty) {
+        builder.append(s"$edgeDefinition $fullGuardClause\n\n")
+      } else {
+        builder.append(s"$edgeDefinition $fullGuardClause then {\n")
+        builder.append(bodyBuilder.toString().stripSuffix("\n"))
+        builder.append("\n}\n\n")
+      }
+    }
+    builder.toString()
+  }
+
+  private def translateModular(stx: RxGraph, inputScript: String): String = {
+    val builder = new StringBuilder()
+    val allSimpleEdges: List[Edge] = stx.edg.flatMap { case (src, tgts) => tgts.map(t => (src, t._1, t._2, t._3)) }.toList
+    val allActiveLabels = stx.lbls.keySet.filter(_.n.nonEmpty)
+
+    builder.append("// Global control variables\n")
+    for (label <- allActiveLabels.toList.sortBy(_.toString)) {
+      val isInitiallyActive = stx.lbls.get(label).exists(_.exists(stx.act.contains))
+      builder.append(s"int ${sanitizeForVar(label)}_active = ${if (isInitiallyActive) 1 else 0}\n")
+    }
+
+    val edgesByAut = allSimpleEdges.groupBy(e => getScope(e._1).getOrElse(""))
+    val knownScopes = edgesByAut.keySet
+
+
+
+    for ((autName, edges) <- edgesByAut if autName.nonEmpty) {
+      builder.append(s"\naut $autName {\n")
+      stx.inits.find(_.n.headOption.contains(autName)).foreach { i =>
+        builder.append(s"  init ${formatQName(unqualify(i))}\n\n")
+      }
+      for (edge <- edges.sortBy(e => (e._1.toString, e._2.toString, e._3.toString, e._4.toString))) {
+        builder.append(generateTransitionCode(edge, stx))
+      }
+      builder.append("}\n")
+    }
+    builder.toString()
+  }
+
+  private def generateTransitionCode(edge: Edge, stx: RxGraph): String = {
+    val (source, target, transId, label) = edge
+    val bodyBuilder = new StringBuilder()
+    val baseIndent = "  "
+
+    val mainGuardParts = collection.mutable.ListBuffer[String]()
+    if (label.n.nonEmpty) mainGuardParts += s"${sanitizeForVar(label)}_active == 1"
+    stx.edgeConditions.get(edge).flatten.foreach(og => mainGuardParts += s"(${conditionToString(og)})")
+
+    val allEffects = findAllTriggeredEffects(label, stx)
+    for (effect <- allEffects) {
+      val updateStatement = if (effect.effectType == "on") s"${sanitizeForVar(effect.targetLabel)}_active' := 1" else s"${sanitizeForVar(effect.targetLabel)}_active' := 0"
+      bodyBuilder.append(s"$baseIndent    // Effect from group ${label.show}\n")
+      val effectGuardParts = collection.mutable.ListBuffer[String]()
+      if (effect.ruleLabel.n.nonEmpty) effectGuardParts += s"${sanitizeForVar(effect.ruleLabel)}_active == 1"
+      stx.edgeConditions.get((effect.originalTrigger, effect.targetLabel, effect.ruleId, effect.ruleLabel)).flatten.foreach(cond => effectGuardParts += s"(${conditionToString(cond)})")
+
+      if (effectGuardParts.isEmpty) bodyBuilder.append(s"$baseIndent    $updateStatement\n")
+      else bodyBuilder.append(s"$baseIndent    if (${effectGuardParts.mkString(" AND ")}) then {\n$baseIndent        $updateStatement\n$baseIndent    }\n")
+    }
+    
+    val uSrc = formatQName(unqualify(source)); val uDst = formatQName(unqualify(target))
+    val uTid = formatQName(unqualify(transId)); val uLbl = formatQName(unqualify(label))
+    val edgeDef = s"$baseIndent$uSrc - $uTid -> $uDst : $uLbl"
+    val fullGuard = if (mainGuardParts.nonEmpty) s" if (${mainGuardParts.mkString(" AND ")})" else ""
+    
+    if (bodyBuilder.isEmpty) s"$edgeDef$fullGuard\n"
+    else s"$edgeDef$fullGuard then {\n${bodyBuilder.toString().stripSuffix("\n")}\n$baseIndent}\n"
+  }
+
+  private def getScope(q: QName): Option[String] = q.n.headOption
+  private def formatQName(q: QName): String = q.n.mkString(".")
+  private def sanitizeForVar(q: QName): String = q.n.mkString("_")
+  private def unqualify(q: QName): QName = if (q.n.length > 1) QName(q.n.tail) else q
+
+  private def getConditionVars(cond: Condition): Set[QName] = cond match {
+    case Condition.AtomicCond(left, _, right) => Set(left) ++ (right match { case Right(q) => Set(q); case _ => Set.empty })
+    case Condition.And(l, r) => getConditionVars(l) ++ getConditionVars(r)
+    case Condition.Or(l, r) => getConditionVars(l) ++ getConditionVars(r)
+  }
+
+  private def findAllTriggeredEffects(triggerLabel: QName, stx: RxGraph): List[Effect] = {
+    val effects = collection.mutable.ListBuffer[Effect]()
+    val queue = collection.mutable.Queue[QName](triggerLabel)
+    val visited = collection.mutable.Set[QName]()
+    while (queue.nonEmpty) {
+      val curr = queue.dequeue()
+      if (!visited.contains(curr)) {
+        visited.add(curr)
+        stx.on.getOrElse(curr, Set.empty).foreach { case (trg, rid, rlbl) =>
+          effects += Effect("on", trg, rid, rlbl, curr)
+          if (rlbl.n.nonEmpty) queue.enqueue(rlbl)
+        }
+        stx.off.getOrElse(curr, Set.empty).foreach { case (trg, rid, rlbl) =>
+          effects += Effect("off", trg, rid, rlbl, curr)
+          if (rlbl.n.nonEmpty) queue.enqueue(rlbl)
+        }
+      }
+    }
+    effects.toList
+  }
+
+  private def conditionToString(cond: Condition): String = cond.toMermaidString
+
+  private def statementToString(stmt: Statement): String = stmt match {
+    case UpdateStmt(upd) => s"${upd.variable.show}' := ${UpdateExpr.show(upd.expr)}"
+    case IfThenStmt(c, ts) => s"if (${conditionToString(c)}) then { ${ts.map(statementToString).mkString("; ")} }"
+  }
+}
+

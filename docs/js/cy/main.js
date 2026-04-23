@@ -25,31 +25,54 @@ const getLayoutKey = s => {
 window.stopAutoDelay = stopAutoDelay;
 
 
-function updateAllViews(jsonResponse) {
-    if (!jsonResponse || jsonResponse.startsWith('{"error"')) {
-        console.error("Erro na resposta:", jsonResponse);
-        return;
+
+const originalUpdateAllViews = window.updateAllViews;
+window.updateAllViews = function(json) {
+    if (typeof originalUpdateAllViews === 'function' && originalUpdateAllViews !== window.updateAllViews) {
+        originalUpdateAllViews(json);
     }
-
-    var data = JSON.parse(jsonResponse);
-
-    renderCytoscapeGraph("cytoscapeMainContainer", data, false);
-    updatePathfindingDropdown(data); 
-
-    renderGlobalPanel(data);
-
-    var activeTab = document.querySelector('.nav-tabs li.active a').getAttribute('href');
-    if (activeTab === '#mermaidTab') renderMermaidView();
-    if (activeTab === '#txtTab') renderTextView();
     
+    try {
+        var data = JSON.parse(json);
+        if (data.error) {
+            console.error("Erro no modelo:", data.error);
+            return;
+        }
 
-    if (data.lastTransition) {
-        textTraceHistory.push(data.lastTransition.to);
-    } else if (data.panelData && !data.panelData.canUndo) {
-        textTraceHistory = [];
+        if (typeof renderGlobalPanel === 'function') {
+            renderGlobalPanel(data, 'sidePanel');        
+            renderGlobalPanel(data, 'sidePanel-bottom'); 
+        }
+
+        if (typeof renderCytoscapeGraph === 'function') {
+            renderCytoscapeGraph("cytoscapeMainContainer", data, false);
+        }
+        
+        if (typeof renderTextView === 'function') renderTextView();
+        if (typeof renderMermaidView === 'function') renderMermaidView();
+        
+        if (typeof renderPdlHelpers === 'function') renderPdlHelpers(data);
+        
+        if (data && data.panelData) {
+            var sbStates = document.getElementById('sb-states');
+            var trans = data.panelData.enabled || [];
+            if (sbStates) {
+                sbStates.textContent = trans.length + ' transition' + (trans.length !== 1 ? 's' : '') + ' enabled';
+            }
+            
+            var sbModel = document.getElementById('sb-model');
+            if (sbModel) {
+                sbModel.textContent = 'Model active';
+                sbModel.style.color = '#86EFAC';
+            }
+        }
+
+        lastModelData = data;
+
+    } catch (e) {
+        console.error("Erro ao processar updateAllViews:", e);
     }
-}
-
+};
 
 function renderCytoscapeGraph(mainContainerId, dataOrJson, isFirstRender) {
     var mainContainer = document.getElementById(mainContainerId);

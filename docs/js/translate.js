@@ -159,20 +159,25 @@ function changeLanguage(lang) {
 }
 
 
+
 function applyTranslations() {
     $('[data-i18n]').each(function () {
         const key = $(this).data('i18n');
         if (i18n[currentLang][key]) {
-            $(this).text(i18n[currentLang][key]);
+            if ($(this).is('input, textarea')) {
+                $(this).attr('placeholder', i18n[currentLang][key]);
+            } else {
+                $(this).text(i18n[currentLang][key]);
+            }
         }
     });
 
-    $('#pdlFormula').attr('placeholder', currentLang === 'pt' ? 'Fórmula (Ex: <a>true)' : 'Formula (Ex: <a>true)');
+    $('#pdlFormula').attr('placeholder', i18n[currentLang]['pdl_placeholder']);
+    $('#trainingArea').attr('placeholder', i18n[currentLang]['training_ph']);
 
-    if (document.getElementById("examplesSelect").value !== "") {
-        loadExample();
+    if (typeof updateExampleDescription === "function") {
+        updateExampleDescription();
     }
-
 }
 
 $(document).ready(function () {
