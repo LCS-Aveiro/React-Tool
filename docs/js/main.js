@@ -196,18 +196,13 @@ function updateBPField() {
     const type = document.getElementById('bpType').value;
     const label = document.getElementById('bpValueLabel');
     const input = document.getElementById('bpValue');
-    const intContainer = document.getElementById('bpIntContainer');
 
     if (type === 'state') {
         label.innerText = "Target State";
         input.placeholder = "e.g. s1";
-        intContainer.style.display = 'none';
     } else {
         label.innerText = "Condition (Boolean Expression)";
         input.placeholder = "e.g. u1==0 && u2==0 && d1==1";
-        // Se você quiser digitar a expressão toda no campo acima, 
-        // mantemos o intContainer escondido.
-        intContainer.style.display = 'none'; 
     }
 }
 
@@ -223,7 +218,6 @@ function findPathByValue() {
         return;
     }
 
-    // Mostrar a caixa e limpar resultados anteriores
     resultBox.style.display = 'block';
     summaryDiv.innerHTML = "Analyzing model...";
     summaryDiv.style.color = "var(--gray-700)";
@@ -232,15 +226,12 @@ function findPathByValue() {
     let response;
     
     if (type === 'state') {
-        // Busca caminho para um estado específico (ex: "s1")
         response = RTA.findBestPath(targetValue);
     } else {
-        // Busca caminho para uma expressão complexa (ex: "u1==0 && u2==0")
         response = RTA.findPathToValue(targetValue);
     }
 
     try {
-        // O Scala retorna uma string JSON que precisamos converter
         const data = (typeof response === 'string') ? JSON.parse(response) : response;
 
         if (data.error) {
