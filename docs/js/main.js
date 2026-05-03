@@ -55,7 +55,7 @@ function loadAndRender() {
 
 
 
-function updateProjectTree() {
+function updateProjectTree(highlightName) {
     const tree = document.getElementById("project-tree");
     if (!tree) return;
     tree.innerHTML = "";
@@ -69,14 +69,14 @@ function updateProjectTree() {
     const saved = localStorage.getItem('rta_user_custom_models');
     if (saved) userModels = JSON.parse(saved);
 
-    renderTreeSection(tree, "Examples", nativeExamples, "📁", false);
+    renderTreeSection(tree, "Examples", nativeExamples, "📁", false, highlightName);
 
     if (Object.keys(userModels).length > 0) {
-        renderTreeSection(tree, "My Models", userModels, "⭐", true);
+        renderTreeSection(tree, "My Models", userModels, "⭐", true, highlightName);
     }
 }
 
-function renderTreeSection(container, title, models, icon, isUser) {
+function renderTreeSection(container, title, models, icon, isUser, highlightName) {
     const header = document.createElement("div");
     header.className = "tree-item";
     header.style.fontWeight = "bold";
@@ -87,7 +87,12 @@ function renderTreeSection(container, title, models, icon, isUser) {
     for (let name in models) {
         const item = document.createElement("div");
         item.className = "tree-item tree-indent";
-        item.innerHTML = `<span class="tree-icon">📄</span> ${name}.rta`;
+        
+        if (name === highlightName) {
+            item.classList.add('selected');
+        }
+
+        item.innerHTML = `<span class="tree-icon">📄</span> ${name}.r`;
         
         item.onclick = function() {
             selectTreeItem(item);
@@ -112,7 +117,7 @@ function loadModelFromTree(code, name) {
     }
     showCanvasTab('editorTab');
     
-    document.getElementById('sb-model').textContent = name + ".rta";
+    document.getElementById('sb-model').textContent = name + ".r";
 }
 
 function selectTreeItem(element) {
